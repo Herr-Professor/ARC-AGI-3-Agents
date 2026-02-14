@@ -18,436 +18,344 @@ logger = logging.getLogger(__name__)
 
 
 class RLM(ReasoningLLM):
-    """Lean recursive language-model agent.
+    """Recursive language-model scaffold for ARC-AGI-3.
 
-    - Root level picks a game action.
-    - Any level can call `call_subproblem` for symbolic decomposition.
-    - Subproblems return compact insights (`return_insight`).
-    - Agent keeps compact external memory outside model context.
-    - A guarded `python_repl` tool exposes persistent `ctx` for code-space reasoning.
+    - External memory (facts, transitions, per-state action stats)
+    - Query tools (peek_window / python_repl / store_fact / call_subproblem)
+    - Root must choose exactly ONE game action tool per turn (ARC convention)
     """
 
-    MAX_ACTIONS: int = 120
-    DO_OBSERVATION: bool = True
+    MAX_ACTIONS = 120
+    DO_OBSERVATION = True
     MODEL = "gpt-5-mini"
     MODEL_REQUIRES_TOOLS = True
     REASONING_EFFORT: Optional[str] = None
 
-    RLM_MAX_INTERNAL_STEPS = 6
-    RLM_MAX_SUB_STEPS = 4
-    RLM_MAX_DEPTH = 3
-    RLM_MAX_FACTS = 64
-    RLM_MAX_TRANSITIONS = 64
-    RLM_MAX_SUBPROBLEMS = 32
-    RLM_MAX_GRID_SUMMARIES = 2
-    RLM_HISTOGRAM_TOP_K = 8
-    RLM_FOCUS_WINDOW_DEFAULT = 12
+    INTERNAL_STEPS = 6
+    SUB_STEPS = 4
+    MAX_DEPTH = 3
+    MAX_FACTS = 64
+    MAX_TRANSITIONS = 64
+    MAX_SUBPROBLEMS = 32
+    MAX_STATES = 256
+    GRID_SAMPLES = 2
+    HIST_TOP_K = 8
+    WINDOW_DEFAULT = 12
 
-    memory_facts: list[dict[str, Any]]
-    transition_log: list[dict[str, Any]]
-    subproblem_log: list[dict[str, Any]]
-    sent_actions: list[str]
-    tested_actions_by_state: dict[str, dict[str, dict[str, float]]]
-    state_visits: dict[str, int]
-    current_state_key: Optional[str]
-    context_store: dict[str, Any]
-    client: OpenAIClient
+    _EMPTY_PARAMS: dict[str, Any] = {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    }
 
     def __init__(self, *args: Any, **kwargs: Any) -> None:
         super().__init__(*args, **kwargs)
-        self.memory_facts = []
-        self.transition_log = []
-        self.subproblem_log = []
-        self.sent_actions = []
-        self.tested_actions_by_state = {}
-        self.state_visits = defaultdict(int)
-        self.current_state_key = None
-        self.context_store = {
-            "globals": {},
-            "runs": 0,
-            "latest_state_key": "",
-        }
         self.client = OpenAIClient(api_key=os.environ.get("OPENAI_API_KEY", ""))
+
+        self.facts: list[dict[str, Any]] = []
+        self.transitions: list[dict[str, Any]] = []
+        self.subproblems: list[dict[str, Any]] = []
+        self.sent_actions: list[str] = []
+
+        self.by_state: dict[str, dict[str, dict[str, float]]] = {}
+        self.state_visits: dict[str, int] = defaultdict(int)
+        self.state_key: str = ""
+
+        self.ctx: dict[str, Any] = {"globals": {}, "runs": 0}
 
     @property
     def name(self) -> str:
         sanitized_model_name = self.MODEL.replace("/", "-").replace(":", "-")
-        return f"{super().name}.{sanitized_model_name}.recursive"
+        return f"{super().name}.{sanitized_model_name}.rlm"
 
-    def build_user_prompt(self, latest_frame: FrameData) -> str:  # unused by RLM
-        return ""
-
-    def choose_action(
-        self, frames: list[FrameData], latest_frame: FrameData
-    ) -> GameAction:
-        if latest_frame.state in [GameState.NOT_PLAYED, GameState.GAME_OVER]:
+    def choose_action(self, frames: list[FrameData], latest_frame: FrameData) -> GameAction:
+        if getattr(latest_frame, "full_reset", False) or latest_frame.state in (
+            GameState.NOT_PLAYED,
+            GameState.GAME_OVER,
+        ):
+            self._reset_memory()
             action = GameAction.RESET
-            action.reasoning = {
-                "agent": "RLM",
-                "mode": "bootstrap_reset",
-                "state": latest_frame.state.name,
-                "turn": self.action_counter,
-            }
-            self._record_sent_action(action)
+            action.reasoning = {"agent": "RLM", "mode": "reset", "turn": self.action_counter}
+            self._record_action(action)
             return action
 
         self._ingest_transition(frames, latest_frame)
-        grid = self._select_planning_grid(latest_frame)
-        self.current_state_key = self._state_key_for_grid(grid) if grid else None
-        if self.current_state_key:
-            self.state_visits[self.current_state_key] += 1
-        self.context_store["latest_state_key"] = self.current_state_key or ""
-        self.context_store["latest_grid"] = self._select_planning_grid(latest_frame)
 
-        result = self._solve_subproblem(
+        grid = self._grid(latest_frame)
+        self.state_key = self._hash_grid(grid)
+        if self.state_key:
+            self.state_visits[self.state_key] += 1
+
+        result = self._solve(
             latest_frame=latest_frame,
             objective="Choose the next game action.",
             focus="recent_transition",
             depth=0,
-            x=None,
-            y=None,
-            size=None,
             allow_action=True,
         )
 
-        action = result.get("action")
-        forced = action is None
-        if forced:
-            action = self._fallback_action(latest_frame)
+        action = result.get("action") or self._fallback_action(latest_frame)
+        forced = result.get("action") is None
 
-        action.reasoning = self._build_replay_reasoning(
-            latest_frame=latest_frame,
-            selected_action=action,
-            turn_trace=result.get("trace", []),
-            forced_action_used=forced,
-        )
-        self._record_sent_action(action)
+        if action.name == GameAction.RESET.name:
+            self._reset_memory()
+
+        action.reasoning = {
+            "agent": "RLM",
+            "model": self.MODEL,
+            "turn": self.action_counter,
+            "forced": forced,
+            "state": latest_frame.state.name,
+            "levels_completed": int(latest_frame.levels_completed),
+            "state_key": self.state_key,
+            "facts": len(self.facts),
+            "transitions": len(self.transitions),
+            "subproblems": len(self.subproblems),
+            "trace": (result.get("trace") or [])[-8:],
+        }
+        self._record_action(action)
         return action
 
-    def _solve_subproblem(
+    def _solve(
         self,
         latest_frame: FrameData,
         objective: str,
         focus: str,
         depth: int,
-        x: Any,
-        y: Any,
-        size: Any,
         allow_action: bool,
+        x: Any = None,
+        y: Any = None,
+        size: Any = None,
     ) -> dict[str, Any]:
-        if depth > self.RLM_MAX_DEPTH:
-            return {
-                "status": "depth_limit",
-                "objective": objective,
-                "depth": depth,
-                "insight": "Maximum recursion depth reached.",
-                "confidence": 0.0,
-                "trace": [],
-            }
+        if depth > self.MAX_DEPTH:
+            return {"status": "depth_limit", "objective": objective, "confidence": 0.0, "trace": []}
 
-        tools = self._build_query_tools(include_return_insight=not allow_action)
+        tools = self._query_tools(include_return_insight=not allow_action)
         if allow_action:
             tools += self._action_tools(latest_frame)
-        messages = [
-            {"role": "system", "content": self._build_system_prompt(depth, allow_action)},
-            {
-                "role": "user",
-                "content": self._build_problem_user_prompt(
-                    latest_frame=latest_frame,
-                    objective=objective,
-                    focus=focus,
-                    depth=depth,
-                    x=x,
-                    y=y,
-                    size=size,
-                    allow_action=allow_action,
-                ),
-            },
-        ]
-        trace: list[dict[str, Any]] = []
-        step_budget = self.RLM_MAX_INTERNAL_STEPS if allow_action else self._subproblem_step_budget(depth)
 
-        for _ in range(step_budget):
-            message = self._call_chat(messages, tools, tool_required=True)
-            tool_calls = message.get("tool_calls") or []
+        messages = [
+            {"role": "system", "content": self._system_prompt(depth, allow_action)},
+            {"role": "user", "content": self._user_payload(latest_frame, objective, focus, depth, allow_action, x, y, size)},
+        ]
+
+        trace: list[dict[str, Any]] = []
+        steps = self.INTERNAL_STEPS if allow_action else max(1, self.SUB_STEPS - max(0, depth - 1))
+
+        for _ in range(steps):
+            msg = self._chat(messages, tools, tool_required=True)
+            tool_calls = msg.get("tool_calls") or []
             if not tool_calls:
                 break
 
             messages.append({"role": "assistant", "tool_calls": tool_calls})
-            tool_call = tool_calls[0]
-            fn = tool_call.get("function", {})
-            fn_name = str(fn.get("name", ""))
-            args = self._json_object(fn.get("arguments", "{}"))
-            tool_call_id = str(tool_call.get("id", "call_0"))
 
-            if allow_action and self._is_game_action_name(fn_name):
-                action = self._build_action_from_tool(fn_name, args)
-                trace.append({"depth": depth, "type": "action", "name": fn_name, "args": args})
-                return {
-                    "status": "action",
-                    "depth": depth,
-                    "objective": objective,
-                    "action": action,
-                    "trace": trace,
-                }
+            action_call: Optional[dict[str, Any]] = None
+            for tc in tool_calls:
+                fn = (tc.get("function") or {})
+                name = str(fn.get("name", ""))
+                args = self._json_obj(fn.get("arguments"))
+                tc_id = str(tc.get("id", "call_0"))
 
-            if fn_name == "return_insight":
-                insight = str(args.get("insight", "")).strip() or "No insight."
-                evidence = str(args.get("evidence", "")).strip()
-                confidence = self._safe_float(args.get("confidence"), 0.5)
-                self._remember_fact("subproblem_insight", insight, confidence)
-                self._remember_subproblem(objective, depth, "insight", confidence)
-                trace.append(
-                    {
+                if allow_action and self._is_game_action(name):
+                    if action_call is None:
+                        action_call = tc
+                        messages.append({"role": "tool", "tool_call_id": tc_id, "content": json.dumps({"acknowledged": True})})
+                    else:
+                        messages.append(
+                            {
+                                "role": "tool",
+                                "tool_call_id": tc_id,
+                                "content": "Error: assistant can only call one action (tool) at a time. default to only the first chosen action.",
+                            }
+                        )
+                    continue
+
+                if name == "return_insight":
+                    insight = str(args.get("insight", "")).strip() or "No insight."
+                    evidence = str(args.get("evidence", "")).strip()
+                    conf = self._safe_float(args.get("confidence"), 0.5)
+                    self._remember_fact("subproblem_insight", insight, conf)
+                    self._remember_subproblem(objective, depth, "insight", conf)
+                    trace.append({"depth": depth, "type": "return_insight", "confidence": conf})
+                    messages.append({"role": "tool", "tool_call_id": tc_id, "content": json.dumps({"stored": True})})
+                    return {
+                        "status": "insight",
                         "depth": depth,
-                        "type": "return_insight",
-                        "confidence": confidence,
+                        "objective": objective,
+                        "insight": insight,
+                        "evidence": evidence,
+                        "confidence": conf,
+                        "trace": trace,
                     }
-                )
-                return {
-                    "status": "insight",
-                    "depth": depth,
-                    "objective": objective,
-                    "insight": insight,
-                    "evidence": evidence,
-                    "confidence": confidence,
-                    "trace": trace,
-                }
 
-            payload: dict[str, Any]
-            if fn_name == "peek_window":
-                payload = self._query_peek_window(args, latest_frame)
-                trace.append({"depth": depth, "type": "peek_window"})
-            elif fn_name == "python_repl":
-                payload = self._query_python_repl(args, latest_frame)
-                trace.append({"depth": depth, "type": "python_repl"})
-            elif fn_name == "store_fact":
-                payload = self._store_fact_from_args(args)
-                trace.append({"depth": depth, "type": "store_fact"})
-            elif fn_name == "call_subproblem":
-                payload = self._solve_subproblem(
-                    latest_frame=latest_frame,
-                    objective=str(args.get("objective", objective)),
-                    focus=str(args.get("focus", focus)),
-                    depth=depth + 1,
-                    x=args.get("x"),
-                    y=args.get("y"),
-                    size=args.get("size"),
-                    allow_action=False,
-                )
-                self._remember_subproblem(
-                    objective=str(args.get("objective", objective)),
-                    depth=depth + 1,
-                    status=str(payload.get("status", "")),
-                    confidence=self._safe_float(payload.get("confidence"), 0.2),
-                )
-                trace.append(
-                    {
-                        "depth": depth,
-                        "type": "subproblem",
-                        "payload": self._compact_subproblem_payload(payload),
-                    }
-                )
-            else:
-                payload = {"error": f"Unknown tool {fn_name}"}
-                trace.append({"depth": depth, "type": "unknown_tool", "name": fn_name})
+                if name == "peek_window":
+                    payload = self._peek(args, latest_frame)
+                    trace.append({"depth": depth, "type": "peek_window"})
+                elif name == "python_repl":
+                    payload = self._python(args, latest_frame)
+                    trace.append({"depth": depth, "type": "python_repl"})
+                elif name == "store_fact":
+                    payload = self._store_fact(args)
+                    trace.append({"depth": depth, "type": "store_fact"})
+                elif name == "call_subproblem":
+                    payload = self._solve(
+                        latest_frame=latest_frame,
+                        objective=str(args.get("objective", objective)),
+                        focus=str(args.get("focus", focus)),
+                        depth=depth + 1,
+                        allow_action=False,
+                        x=args.get("x"),
+                        y=args.get("y"),
+                        size=args.get("size"),
+                    )
+                    self._remember_subproblem(
+                        objective=str(args.get("objective", objective)),
+                        depth=depth + 1,
+                        status=str(payload.get("status", "")),
+                        confidence=self._safe_float(payload.get("confidence"), 0.2),
+                    )
+                    trace.append({"depth": depth, "type": "subproblem", "status": payload.get("status")})
+                else:
+                    payload = {"error": f"Unknown tool {name}"}
+                    trace.append({"depth": depth, "type": "unknown_tool", "name": name})
 
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tool_call_id,
-                    "content": json.dumps(payload),
-                }
-            )
+                messages.append({"role": "tool", "tool_call_id": tc_id, "content": json.dumps(payload)})
 
-        if allow_action:
-            return {
-                "status": "no_action",
-                "depth": depth,
-                "objective": objective,
-                "action": None,
-                "trace": trace,
-            }
+            if action_call is not None:
+                fn = (action_call.get("function") or {})
+                name = str(fn.get("name", ""))
+                args = self._json_obj(fn.get("arguments"))
+                action = self._action_from_tool(name, args)
+                trace.append({"depth": depth, "type": "action", "name": name, "args": args})
+                return {"status": "action", "depth": depth, "objective": objective, "action": action, "trace": trace}
 
-        self._remember_subproblem(objective, depth, "budget_exhausted", 0.2)
-        return {
-            "status": "insight",
-            "depth": depth,
-            "objective": objective,
-            "insight": "No conclusive subproblem output.",
-            "evidence": "Subproblem budget exhausted.",
-            "confidence": 0.2,
-            "trace": trace,
-        }
+        return {"status": "no_action" if allow_action else "insight", "depth": depth, "objective": objective, "action": None, "confidence": 0.2, "trace": trace}
 
-    def _build_system_prompt(self, depth: int, allow_action: bool) -> str:
+    def _system_prompt(self, depth: int, allow_action: bool) -> str:
         if allow_action:
             return (
-                "You are the root controller of a recursive language-model agent. "
-                "Use one tool per response. "
-                "Inspect state with query tools, delegate with call_subproblem, "
-                "use python_repl for code-level context reasoning, "
-                "then emit exactly one game action tool."
+                "You are the root controller of a recursive tool-using agent playing a grid puzzle game.\n"
+                "IMPORTANT: Call exactly ONE available action tool per turn.\n"
+                "You may use peek_window/python_repl/store_fact/call_subproblem to inspect before acting."
             )
-        remaining_depth = max(0, self.RLM_MAX_DEPTH - depth)
         return (
-            "You are solving a bounded recursive subproblem. "
-            f"Current recursion depth: {depth}/{self.RLM_MAX_DEPTH}. "
-            "Use one tool per response. "
-            "You may use call_subproblem to further decompose this problem "
-            f"({remaining_depth} recursive level(s) remaining). "
-            "Use peek_window or python_repl for inspection and computation. "
-            "When you have a conclusion, call return_insight."
+            f"You are solving a bounded recursive subproblem (depth {depth}/{self.MAX_DEPTH}). "
+            "Use tools to inspect/compute, then call return_insight."
         )
 
-    def _build_problem_user_prompt(
+    def _user_payload(
         self,
         latest_frame: FrameData,
         objective: str,
         focus: str,
         depth: int,
+        allow_action: bool,
         x: Any,
         y: Any,
         size: Any,
-        allow_action: bool,
     ) -> str:
         payload: dict[str, Any] = {
-            "task": {
-                "objective": objective,
-                "focus": focus,
-                "depth": depth,
-                "mode": "root" if allow_action else "subproblem",
-            },
+            "task": {"objective": objective, "focus": focus, "depth": depth, "mode": "root" if allow_action else "subproblem"},
             "frame": self._frame_summary(latest_frame, include_samples=not allow_action),
             "memory": self._memory_snapshot(),
-            "latest_transition": self.transition_log[-1] if self.transition_log else {},
-            "budgets": {
-                "internal_steps": self.RLM_MAX_INTERNAL_STEPS,
-                "subproblem_steps": self._subproblem_step_budget(depth),
-                "max_depth": self.RLM_MAX_DEPTH,
-            },
+            "latest_transition": self.transitions[-1] if self.transitions else {},
+            "budgets": {"internal_steps": self.INTERNAL_STEPS, "subproblem_steps": self.SUB_STEPS, "max_depth": self.MAX_DEPTH},
         }
         if x is not None and y is not None and size is not None:
             payload["task"]["window"] = {
-                "x": self._safe_int(x, default=0, lo=0, hi=63),
-                "y": self._safe_int(y, default=0, lo=0, hi=63),
-                "size": self._safe_int(size, default=self.RLM_FOCUS_WINDOW_DEFAULT, lo=2, hi=32),
+                "x": self._safe_int(x, 0, 0, 63),
+                "y": self._safe_int(y, 0, 0, 63),
+                "size": self._safe_int(size, self.WINDOW_DEFAULT, 2, 32),
             }
         return json.dumps(payload, indent=2)
 
-    def _build_query_tools(self, include_return_insight: bool) -> list[dict[str, Any]]:
+    def _tool(self, name: str, description: str, parameters: dict[str, Any]) -> dict[str, Any]:
+        return {"type": "function", "function": {"name": name, "description": description, "parameters": parameters, "strict": True}}
+
+    def _query_tools(self, include_return_insight: bool) -> list[dict[str, Any]]:
         tools = [
-            self._fn_tool(
-                name="peek_window",
-                description="Inspect a small window from the latest planning grid.",
-                properties={
-                    "x": {"type": "integer"},
-                    "y": {"type": "integer"},
-                    "size": {"type": "integer"},
+            self._tool(
+                "peek_window",
+                "Inspect a small window from the latest planning grid.",
+                {
+                    "type": "object",
+                    "properties": {"x": {"type": "integer"}, "y": {"type": "integer"}, "size": {"type": "integer"}},
+                    "required": ["x", "y", "size"],
+                    "additionalProperties": False,
                 },
             ),
-            self._fn_tool(
-                name="python_repl",
-                description="Execute short Python over persistent ctx, frame, and memory views.",
-                properties={"code": {"type": "string"}},
+            self._tool(
+                "python_repl",
+                "Execute short Python over persistent ctx, frame, and memory views.",
+                {
+                    "type": "object",
+                    "properties": {"code": {"type": "string"}},
+                    "required": ["code"],
+                    "additionalProperties": False,
+                },
             ),
-            self._fn_tool(
-                name="call_subproblem",
-                description="Recursively solve a focused subproblem.",
-                properties={
-                    "objective": {"type": "string"},
-                    "focus": {
-                        "type": "string",
-                        "enum": [
-                            "full_grid",
-                            "window",
-                            "recent_transition",
-                            "hypothesis_check",
-                        ],
+            self._tool(
+                "call_subproblem",
+                "Recursively solve a focused subproblem.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "objective": {"type": "string"},
+                        "focus": {"type": "string", "enum": ["full_grid", "window", "recent_transition", "hypothesis_check"]},
+                        "x": {"type": ["integer", "null"]},
+                        "y": {"type": ["integer", "null"]},
+                        "size": {"type": ["integer", "null"]},
                     },
-                    "x": {"type": ["integer", "null"]},
-                    "y": {"type": ["integer", "null"]},
-                    "size": {"type": ["integer", "null"]},
+                    "required": ["objective", "focus", "x", "y", "size"],
+                    "additionalProperties": False,
                 },
             ),
-            self._fn_tool(
-                name="store_fact",
-                description="Persist a durable observation in external memory.",
-                properties={
-                    "category": {"type": "string"},
-                    "fact": {"type": "string"},
-                    "confidence": {"type": "number"},
+            self._tool(
+                "store_fact",
+                "Persist a durable observation in external memory.",
+                {
+                    "type": "object",
+                    "properties": {
+                        "category": {"type": "string"},
+                        "fact": {"type": "string"},
+                        "confidence": {"type": "number"},
+                    },
+                    "required": ["category", "fact", "confidence"],
+                    "additionalProperties": False,
                 },
             ),
         ]
-
         if include_return_insight:
             tools.append(
-                self._fn_tool(
-                    name="return_insight",
-                    description="Return a concrete conclusion for this subproblem.",
-                    properties={
-                        "insight": {"type": "string"},
-                        "evidence": {"type": "string"},
-                        "confidence": {"type": "number"},
+                self._tool(
+                    "return_insight",
+                    "Return a concrete conclusion for this subproblem.",
+                    {
+                        "type": "object",
+                        "properties": {"insight": {"type": "string"}, "evidence": {"type": "string"}, "confidence": {"type": "number"}},
+                        "required": ["insight", "evidence", "confidence"],
+                        "additionalProperties": False,
                     },
                 )
             )
         return tools
 
-    def _action_tools(self, latest_frame: FrameData) -> list[dict[str, Any]]:
-        tools: list[dict[str, Any]] = []
-        for name in self._available_action_names(latest_frame):
-            properties: dict[str, Any] = {}
-            if name == GameAction.ACTION6.name:
-                properties = {
-                    "x": {"type": ["integer", "null"]},
-                    "y": {"type": ["integer", "null"]},
-                }
-            tools.append(
-                self._fn_tool(
-                    name=name,
-                    description=f"Emit game action {name}.",
-                    properties=properties,
-                )
-            )
-        return tools
-
-    def _fn_tool(
-        self,
-        name: str,
-        description: str,
-        properties: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": {
-                    "type": "object",
-                    "properties": properties,
-                    "required": list(properties.keys()),
-                    "additionalProperties": False,
-                },
-                "strict": True,
-            },
-        }
-
-    def _available_action_names(self, latest_frame: FrameData) -> list[str]:
+    def _available_actions(self, latest_frame: FrameData) -> list[str]:
+        """Return action names from the engine, falling back to ACTION1-4."""
         names: list[str] = []
         seen: set[str] = set()
-        entries = list(getattr(latest_frame, "available_actions", []) or [])
-        for row in entries:
+        for row in list(getattr(latest_frame, "available_actions", []) or []):
             name: Optional[str] = None
             if isinstance(row, int):
                 try:
                     name = GameAction.from_id(int(row)).name
                 except ValueError:
-                    name = None
+                    pass
             elif isinstance(row, str):
                 candidate = row.strip().upper()
-                if self._is_game_action_name(candidate):
+                if self._is_game_action(candidate):
                     name = candidate
             elif hasattr(row, "id"):
                 try:
@@ -455,105 +363,81 @@ class RLM(ReasoningLLM):
                     rid = int(raw.value) if hasattr(raw, "value") else int(raw)
                     name = GameAction.from_id(rid).name
                 except Exception:
-                    name = None
-
+                    pass
             if name and name != GameAction.RESET.name and name not in seen:
                 seen.add(name)
                 names.append(name)
+        return names or [GameAction.ACTION1.name, GameAction.ACTION2.name,
+                         GameAction.ACTION3.name, GameAction.ACTION4.name]
 
-        if names:
-            return names
-        return [
-            GameAction.ACTION1.name,
-            GameAction.ACTION2.name,
-            GameAction.ACTION3.name,
-            GameAction.ACTION4.name,
-        ]
+    def _action_tools(self, latest_frame: FrameData) -> list[dict[str, Any]]:
+        """Build action tools with tested/untested hints for the current state."""
+        available = self._available_actions(latest_frame)
+        tested = set()
+        if self.state_key and self.state_key in self.by_state:
+            tested = set(self.by_state[self.state_key].keys())
 
-    def _is_game_action_name(self, name: str) -> bool:
-        upper = str(name).strip().upper()
-        return bool(upper) and any(
-            action.name == upper for action in GameAction if action is not GameAction.RESET
-        )
-
-    def _build_action_from_tool(self, name: str, args: dict[str, Any]) -> GameAction:
-        action = GameAction.from_name(name)
-        if action == GameAction.ACTION6:
-            action.set_data(
-                {
-                    "x": self._safe_int(args.get("x"), default=31, lo=0, hi=63),
-                    "y": self._safe_int(args.get("y"), default=31, lo=0, hi=63),
+        tools: list[dict[str, Any]] = []
+        for name in available:
+            status = "UNTESTED in current state" if name not in tested else "already tried"
+            desc = f"Emit game action {name} ({status}). One of {len(available)} available actions."
+            params: dict[str, Any] = self._EMPTY_PARAMS
+            if name == GameAction.ACTION6.name:
+                params = {
+                    "type": "object",
+                    "properties": {
+                        "x": {"type": "string", "description": "Int<0,63>"},
+                        "y": {"type": "string", "description": "Int<0,63>"},
+                    },
+                    "required": ["x", "y"],
+                    "additionalProperties": False,
                 }
-            )
-            return action
-        action.set_data({})
-        return action
+            tools.append(self._tool(name, desc, params))
+        return tools
 
-    def _query_peek_window(
-        self, args: dict[str, Any], latest_frame: FrameData
-    ) -> dict[str, Any]:
-        grid = self._select_planning_grid(latest_frame)
+
+    def _peek(self, args: dict[str, Any], latest_frame: FrameData) -> dict[str, Any]:
+        grid = self._grid(latest_frame)
         if not grid:
             return {"error": "empty_grid"}
 
-        x = self._safe_int(args.get("x"), default=0, lo=0, hi=63)
-        y = self._safe_int(args.get("y"), default=0, lo=0, hi=63)
-        size = self._safe_int(
-            args.get("size"), default=self.RLM_FOCUS_WINDOW_DEFAULT, lo=2, hi=32
-        )
+        h, w = len(grid), len(grid[0]) if grid else 0
+        size = self._safe_int(args.get("size"), self.WINDOW_DEFAULT, 2, 32)
 
-        h = len(grid)
-        w = len(grid[0]) if h else 0
-        x1 = max(0, min(w, x + size))
-        y1 = max(0, min(h, y + size))
+        x = self._safe_int(args.get("x"), 0, 0, max(0, w - 1))
+        y = self._safe_int(args.get("y"), 0, 0, max(0, h - 1))
+        x1, y1 = min(w, x + size), min(h, y + size)
 
-        window: list[list[int]] = []
-        for yy in range(y, y1):
-            window.append([int(grid[yy][xx]) for xx in range(x, x1)])
+        window = [[int(grid[yy][xx]) for xx in range(x, x1)] for yy in range(y, y1)]
+        return {"x": x, "y": y, "size": size, "shape": [len(window), len(window[0]) if window else 0], "window": window}
 
-        return {
-            "x": x,
-            "y": y,
-            "size": size,
-            "shape": [len(window), len(window[0]) if window else 0],
-            "window": window,
-        }
-
-    def _store_fact_from_args(self, args: dict[str, Any]) -> dict[str, Any]:
-        category = str(args.get("category", "observation"))
+    def _store_fact(self, args: dict[str, Any]) -> dict[str, Any]:
+        cat = str(args.get("category", "observation"))[:64]
         fact = str(args.get("fact", "")).strip()
-        confidence = self._safe_float(args.get("confidence"), 0.5)
+        conf = self._safe_float(args.get("confidence"), 0.5)
         if not fact:
             return {"stored": False, "error": "empty_fact"}
-        self._remember_fact(category, fact, confidence)
-        return {
-            "stored": True,
-            "category": category,
-            "confidence": confidence,
-            "facts_total": len(self.memory_facts),
-        }
+        self._remember_fact(cat, fact, conf)
+        return {"stored": True, "category": cat, "confidence": conf, "facts_total": len(self.facts)}
 
-    def _query_python_repl(
-        self, args: dict[str, Any], latest_frame: FrameData
-    ) -> dict[str, Any]:
+    def _python(self, args: dict[str, Any], latest_frame: FrameData) -> dict[str, Any]:
         code = str(args.get("code", "")).strip()
         if not code:
             return {"ok": False, "error": "empty_code"}
-        if not self._is_safe_repl_code(code):
+        if not self._safe_repl(code):
             return {"ok": False, "error": "unsafe_code"}
 
-        ctx = self.context_store.setdefault("globals", {})
+        ctx = self.ctx.setdefault("globals", {})
         if not isinstance(ctx, dict):
             ctx = {}
-            self.context_store["globals"] = ctx
+            self.ctx["globals"] = ctx
 
-        frame_grid = self._select_planning_grid(latest_frame)
         local_env: dict[str, Any] = {
             "ctx": ctx,
-            "frame": frame_grid,
-            "facts": self.memory_facts,
-            "transitions": self.transition_log,
-            "subproblems": self.subproblem_log,
+            "frame": self._grid(latest_frame),
+            "facts": self.facts,
+            "transitions": self.transitions,
+            "subproblems": self.subproblems,
             "result": None,
         }
 
@@ -561,42 +445,25 @@ class RLM(ReasoningLLM):
         try:
             compiled = compile(code, "<rlm_repl>", "exec")
             with contextlib.redirect_stdout(stdout_buf):
-                exec(compiled, self._python_repl_globals(), local_env)
+                exec(compiled, {"__builtins__": self._safe_builtins()}, local_env)
         except Exception as exc:
             logger.debug("python_repl failed", exc_info=True)
-            return {
-                "ok": False,
-                "error": str(exc)[:240],
-                "stdout": stdout_buf.getvalue()[:800],
-                "ctx_keys": self._context_key_preview(),
-            }
+            return {"ok": False, "error": str(exc)[:240], "stdout": stdout_buf.getvalue()[:800], "ctx_keys": self._ctx_keys()}
 
-        updated_ctx = local_env.get("ctx")
-        if isinstance(updated_ctx, dict):
-            self.context_store["globals"] = updated_ctx
-        self.context_store["runs"] = int(self.context_store.get("runs", 0)) + 1
+        if isinstance(local_env.get("ctx"), dict):
+            self.ctx["globals"] = local_env["ctx"]
+        self.ctx["runs"] = int(self.ctx.get("runs", 0)) + 1
 
         return {
             "ok": True,
             "stdout": stdout_buf.getvalue()[:800],
-            "result": self._trim_json_value(
-                local_env.get("result"),
-                max_depth=2,
-                max_items=16,
-                max_string=400,
-            ),
-            "ctx_keys": self._context_key_preview(),
-            "runs": int(self.context_store.get("runs", 0)),
+            "result": self._trim(local_env.get("result")),
+            "ctx_keys": self._ctx_keys(),
+            "runs": int(self.ctx.get("runs", 0)),
         }
 
-    def _context_key_preview(self) -> list[str]:
-        raw = self.context_store.get("globals", {})
-        if not isinstance(raw, dict):
-            return []
-        return sorted([str(k) for k in raw.keys()])[:24]
-
-    def _python_repl_globals(self) -> dict[str, Any]:
-        safe_builtins: dict[str, Any] = {
+    def _safe_builtins(self) -> dict[str, Any]:
+        return {
             "abs": abs,
             "all": all,
             "any": any,
@@ -619,290 +486,203 @@ class RLM(ReasoningLLM):
             "tuple": tuple,
             "zip": zip,
         }
-        return {"__builtins__": safe_builtins}
 
-    def _is_safe_repl_code(self, code: str) -> bool:
+    def _safe_repl(self, code: str) -> bool:
         try:
             tree = ast.parse(code)
         except SyntaxError:
             return False
-
-        blocked_names = {
-            "__import__",
-            "compile",
-            "eval",
-            "exec",
-            "globals",
-            "input",
-            "locals",
-            "open",
-            "os",
-            "subprocess",
-            "sys",
-            "vars",
-        }
+        blocked = {"__import__", "compile", "eval", "exec", "globals", "input", "locals", "open", "os", "subprocess", "sys", "vars"}
         for node in ast.walk(tree):
             if isinstance(node, (ast.Import, ast.ImportFrom)):
                 return False
             if isinstance(node, ast.Attribute) and str(node.attr).startswith("__"):
                 return False
-            if isinstance(node, ast.Name) and node.id in blocked_names:
+            if isinstance(node, ast.Name) and node.id in blocked:
                 return False
         return True
 
-    def _remember_subproblem(
-        self,
-        objective: str,
-        depth: int,
-        status: str,
-        confidence: float,
-    ) -> None:
-        self.subproblem_log.append(
-            {
-                "turn": self.action_counter,
-                "depth": depth,
-                "objective": objective[:160],
-                "status": status,
-                "confidence": round(self._safe_float(confidence, 0.5), 3),
-            }
-        )
-        self.subproblem_log = self.subproblem_log[-self.RLM_MAX_SUBPROBLEMS :]
+    def _is_game_action(self, name: str) -> bool:
+        n = str(name).strip().upper()
+        return any(a.name == n for a in GameAction)
 
-    def _compact_subproblem_payload(self, payload: dict[str, Any]) -> dict[str, Any]:
-        keys = ("status", "objective", "depth", "confidence", "insight", "evidence")
-        out = {k: payload.get(k) for k in keys}
-        if isinstance(payload.get("trace"), list):
-            out["trace_len"] = len(payload["trace"])
-        return out
+    def _action_from_tool(self, name: str, args: dict[str, Any]) -> GameAction:
+        action = GameAction.from_name(name)
+        if action == GameAction.ACTION6:
+            action.set_data(
+                {
+                    "x": self._safe_int(args.get("x"), 31, 0, 63),
+                    "y": self._safe_int(args.get("y"), 31, 0, 63),
+                }
+            )
+        else:
+            action.set_data({})
+        return action
+
+    def _fallback_action(self, latest_frame: Optional[FrameData] = None) -> GameAction:
+        candidates = [GameAction.ACTION1.name, GameAction.ACTION2.name,
+                      GameAction.ACTION3.name, GameAction.ACTION4.name]
+        if latest_frame is not None:
+            candidates = self._available_actions(latest_frame) or candidates
+        tested = self.by_state.get(self.state_key, {})
+        for name in candidates:
+            if name not in tested:
+                return self._action_from_tool(name, {})
+
+        def score(name: str) -> float:
+            row = tested.get(name, {})
+            s = max(1.0, float(row.get("samples", 1.0)))
+            avg_level = float(row.get("sum_level_delta", 0.0)) / s
+            avg_changed = float(row.get("sum_changed", 0.0)) / s
+            return (avg_level * 1000.0) + avg_changed
+        return self._action_from_tool(max(candidates, key=score), {})
+
+    def _reset_memory(self) -> None:
+        self.facts = []
+        self.transitions = []
+        self.subproblems = []
+        self.sent_actions = []
+        self.by_state = {}
+        self.state_visits = defaultdict(int)
+        self.state_key = ""
+        self.ctx = {"globals": {}, "runs": 0}
+
+    def _record_action(self, action: GameAction) -> None:
+        self.sent_actions.append(action.name)
+        self.sent_actions = self.sent_actions[-128:]
+
+    def _remember_fact(self, category: str, fact: str, confidence: float) -> None:
+        self.facts.append({"category": category[:64], "fact": fact[:400], "confidence": round(self._safe_float(confidence, 0.5), 3), "turn": int(self.action_counter)})
+        self.facts = self.facts[-self.MAX_FACTS :]
+
+    def _remember_subproblem(self, objective: str, depth: int, status: str, confidence: float) -> None:
+        self.subproblems.append(
+            {"turn": self.action_counter, "depth": depth, "objective": str(objective)[:160], "status": status, "confidence": round(self._safe_float(confidence, 0.5), 3)}
+        )
+        self.subproblems = self.subproblems[-self.MAX_SUBPROBLEMS :]
 
     def _ingest_transition(self, frames: list[FrameData], latest_frame: FrameData) -> None:
         if len(frames) < 2:
             return
-
-        previous = frames[-2]
-        prev_grid = self._select_planning_grid(previous)
-        cur_grid = self._select_planning_grid(latest_frame)
+        prev = frames[-2]
+        prev_grid = self._grid(prev)
+        cur_grid = self._grid(latest_frame)
         if not prev_grid or not cur_grid:
             return
 
-        prev_key = self._state_key_for_grid(prev_grid)
-        cur_key = self._state_key_for_grid(cur_grid)
-        diff = self._grid_diff_summary(prev_grid, cur_grid)
         action_name = self.sent_actions[-1] if self.sent_actions else "UNKNOWN"
-        level_delta = int(latest_frame.levels_completed) - int(previous.levels_completed)
+        level_delta = int(latest_frame.levels_completed) - int(prev.levels_completed)
+        diff = self._diff(prev_grid, cur_grid)
 
-        self.transition_log.append(
-            {
-                "turn": max(0, self.action_counter - 1),
-                "action": action_name,
-                "prev_state_key": prev_key,
-                "state_key": cur_key,
-                "level_delta": level_delta,
-                "diff": diff,
-            }
+        prev_key = self._hash_grid(prev_grid)
+        cur_key = self._hash_grid(cur_grid)
+
+        self.transitions.append(
+            {"turn": max(0, self.action_counter - 1), "action": action_name, "prev_state_key": prev_key, "state_key": cur_key, "level_delta": level_delta, "diff": diff}
         )
-        self.transition_log = self.transition_log[-self.RLM_MAX_TRANSITIONS :]
+        self.transitions = self.transitions[-self.MAX_TRANSITIONS :]
 
         if prev_key and action_name != "UNKNOWN":
-            self._remember_action_outcome(
-                state_key=prev_key,
-                action_name=action_name,
-                changed_cells=int(diff.get("changed_cells", 0)),
-                level_delta=level_delta,
-            )
+            st = self.by_state.setdefault(prev_key, {})
+            row = st.setdefault(action_name, {"samples": 0.0, "sum_changed": 0.0, "sum_level_delta": 0.0, "max_level_delta": 0.0})
+            row["samples"] += 1.0
+            row["sum_changed"] += float(diff.get("changed_cells", 0))
+            row["sum_level_delta"] += float(level_delta)
+            row["max_level_delta"] = max(row["max_level_delta"], float(level_delta))
 
-    def _remember_action_outcome(
-        self,
-        state_key: str,
-        action_name: str,
-        changed_cells: int,
-        level_delta: int,
-    ) -> None:
-        state_entry = self.tested_actions_by_state.setdefault(state_key, {})
-        entry = state_entry.setdefault(
-            action_name,
-            {
-                "samples": 0.0,
-                "sum_changed": 0.0,
-                "sum_level_delta": 0.0,
-                "max_level_delta": 0.0,
-            },
-        )
-        entry["samples"] += 1.0
-        entry["sum_changed"] += float(changed_cells)
-        entry["sum_level_delta"] += float(level_delta)
-        entry["max_level_delta"] = max(entry["max_level_delta"], float(level_delta))
+            while len(self.by_state) > self.MAX_STATES:
+                self.by_state.pop(next(iter(self.by_state)))
 
-    def _fallback_action(self, latest_frame: FrameData) -> GameAction:
-        candidates = self._available_action_names(latest_frame)
-        if not candidates:
-            action = GameAction.RESET
-            action.set_data({})
-            return action
-
-        state_key = self.current_state_key or ""
-        tested = self.tested_actions_by_state.get(state_key, {})
-
-        for name in candidates:
-            if name not in tested:
-                return self._build_action_from_tool(name, {})
-
-        def score(name: str) -> float:
-            row = tested.get(name, {})
-            samples = max(1.0, float(row.get("samples", 1.0)))
-            avg_level = float(row.get("sum_level_delta", 0.0)) / samples
-            avg_changed = float(row.get("sum_changed", 0.0)) / samples
-            return (avg_level * 1000.0) + avg_changed
-
-        return self._build_action_from_tool(max(candidates, key=score), {})
-
-    def _select_planning_grid(self, frame: FrameData) -> list[list[int]]:
-        grids = list(getattr(frame, "frame", []) or [])
-        if not grids:
-            return []
-        first = grids[0]
-        return first if isinstance(first, list) else []
-
-    def _state_key_for_grid(self, grid: list[list[int]]) -> str:
-        if not grid:
-            return ""
-        digest = blake2b(digest_size=12)
-        for row in grid:
-            digest.update(bytes(int(v) & 0xFF for v in row))
-        return digest.hexdigest()
-
-    def _grid_diff_summary(
-        self, prev_grid: list[list[int]], cur_grid: list[list[int]]
-    ) -> dict[str, Any]:
-        h = min(len(prev_grid), len(cur_grid))
-        w = min(len(prev_grid[0]), len(cur_grid[0])) if h > 0 else 0
-        changed = 0
-        x0 = y0 = 10**9
-        x1 = y1 = -1
-
-        for y in range(h):
-            for x in range(w):
-                if int(prev_grid[y][x]) == int(cur_grid[y][x]):
-                    continue
-                changed += 1
-                x0 = min(x0, x)
-                y0 = min(y0, y)
-                x1 = max(x1, x)
-                y1 = max(y1, y)
-
-        bbox = None
-        if changed > 0:
-            bbox = {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1}
-
-        return {"changed_cells": changed, "bbox": bbox}
 
     def _memory_snapshot(self) -> dict[str, Any]:
-        state_key = self.current_state_key or ""
+        tested = self.by_state.get(self.state_key, {})
         return {
-            "state_key": state_key,
-            "state_visits": int(self.state_visits.get(state_key, 0)),
-            "facts": self.memory_facts[-8:],
-            "recent_transitions": self.transition_log[-4:],
-            "recent_subproblems": self.subproblem_log[-4:],
-            "tested_actions_for_state": self.tested_actions_by_state.get(state_key, {}),
-            "python_repl_runs": int(self.context_store.get("runs", 0)),
-            "context_globals_keys": self._context_key_preview(),
+            "state_key": self.state_key,
+            "state_visits": int(self.state_visits.get(self.state_key, 0)),
+            "facts": self.facts[-8:],
+            "recent_transitions": self.transitions[-4:],
+            "recent_subproblems": self.subproblems[-4:],
+            "tested_actions_for_state": tested,
+            "python_repl_runs": int(self.ctx.get("runs", 0)),
+            "context_globals_keys": self._ctx_keys(),
         }
 
-    def _frame_summary(
-        self, latest_frame: FrameData, include_samples: bool
-    ) -> dict[str, Any]:
+    def _frame_summary(self, latest_frame: FrameData, include_samples: bool) -> dict[str, Any]:
         grids = list(getattr(latest_frame, "frame", []) or [])
         return {
             "state": latest_frame.state.name,
             "levels_completed": int(latest_frame.levels_completed),
             "win_levels": int(latest_frame.win_levels),
-            "available_actions": self._available_action_names(latest_frame),
+            "available_actions": self._available_actions(latest_frame),
             "grid_count": len(grids),
-            "state_key": self._state_key_for_grid(self._select_planning_grid(latest_frame)) or None,
-            "grids": [
-                self._grid_stats(grid, include_samples)
-                for grid in grids[: self.RLM_MAX_GRID_SUMMARIES]
-                if isinstance(grid, list)
-            ],
+            "state_key": self._hash_grid(self._grid(latest_frame)) or None,
+            "grids": [self._grid_stats(g, include_samples) for g in grids[: self.GRID_SAMPLES] if isinstance(g, list)],
         }
 
     def _grid_stats(self, grid: list[list[int]], include_samples: bool) -> dict[str, Any]:
         if not grid:
-            return {"shape": [0, 0], "non_zero_cells": 0, "unique_values": 0}
-
-        h = len(grid)
-        w = len(grid[0]) if h else 0
-        histogram: dict[int, int] = defaultdict(int)
-        non_zero = 0
-
+            return {"shape": [0, 0], "unique_values": 0}
+        h, w = len(grid), len(grid[0]) if grid else 0
+        hist: dict[int, int] = defaultdict(int)
         for row in grid:
-            for value in row:
-                v = int(value)
-                histogram[v] += 1
-                if v != 0:
-                    non_zero += 1
-
-        top = sorted(histogram.items(), key=lambda item: item[1], reverse=True)[
-            : self.RLM_HISTOGRAM_TOP_K
-        ]
-        out: dict[str, Any] = {
-            "shape": [h, w],
-            "non_zero_cells": non_zero,
-            "unique_values": len(histogram),
-            "histogram_top": {str(k): int(v) for k, v in top},
-        }
+            for v in row:
+                hist[int(v)] += 1
+        top = sorted(hist.items(), key=lambda kv: kv[1], reverse=True)[: self.HIST_TOP_K]
+        out: dict[str, Any] = {"shape": [h, w], "unique_values": len(hist), "histogram_top": {str(k): int(v) for k, v in top}}
         if include_samples:
-            out["sample_rows"] = [
-                [int(v) for v in grid[i][: min(16, w)]] for i in range(min(8, h))
-            ]
+            out["sample_rows"] = [[int(v) for v in grid[i][: min(16, w)]] for i in range(min(8, h))]
         return out
 
-    def _remember_fact(self, category: str, fact: str, confidence: float) -> None:
-        self.memory_facts.append(
-            {
-                "category": category[:64],
-                "fact": fact[:400],
-                "confidence": round(self._safe_float(confidence, 0.5), 3),
-                "turn": int(self.action_counter),
-            }
-        )
-        self.memory_facts = self.memory_facts[-self.RLM_MAX_FACTS :]
+    def _grid(self, frame: FrameData) -> list[list[int]]:
+        grids = list(getattr(frame, "frame", []) or [])
+        if grids and isinstance(grids[0], list):
+            return grids[0]
+        return []
 
-    def _build_replay_reasoning(
-        self,
-        latest_frame: FrameData,
-        selected_action: GameAction,
-        turn_trace: list[dict[str, Any]],
-        forced_action_used: bool,
-    ) -> dict[str, Any]:
-        latest = self.transition_log[-1] if self.transition_log else {}
-        diff = latest.get("diff") if isinstance(latest.get("diff"), dict) else {}
-        return {
-            "agent": "RLM",
-            "model": self.MODEL,
-            "action": selected_action.name,
-            "forced": forced_action_used,
-            "turn": self.action_counter,
-            "state": latest_frame.state.name,
-            "levels_completed": int(latest_frame.levels_completed),
-            "state_key": self.current_state_key,
-            "latest_transition": {
-                "level_delta": latest.get("level_delta"),
-                "changed_cells": diff.get("changed_cells"),
-                "bbox": diff.get("bbox"),
-            },
-            "facts": len(self.memory_facts),
-            "transitions": len(self.transition_log),
-            "subproblems": len(self.subproblem_log),
-            "trace": turn_trace[-8:],
-        }
+    def _hash_grid(self, grid: list[list[int]]) -> str:
+        if not grid:
+            return ""
+        d = blake2b(digest_size=12)
+        for row in grid:
+            d.update(bytes(int(v) & 0xFF for v in row))
+        return d.hexdigest()
 
-    def _record_sent_action(self, action: GameAction) -> None:
-        self.sent_actions.append(action.name)
-        self.sent_actions = self.sent_actions[-128:]
+    def _diff(self, a: list[list[int]], b: list[list[int]]) -> dict[str, Any]:
+        h = min(len(a), len(b))
+        w = min(len(a[0]), len(b[0])) if h else 0
+        changed = 0
+        x0 = y0 = 10**9
+        x1 = y1 = -1
+        for y in range(h):
+            for x in range(w):
+                if int(a[y][x]) != int(b[y][x]):
+                    changed += 1
+                    x0, y0 = min(x0, x), min(y0, y)
+                    x1, y1 = max(x1, x), max(y1, y)
+        bbox = {"x_min": x0, "y_min": y0, "x_max": x1, "y_max": y1} if changed else None
+        return {"changed_cells": changed, "bbox": bbox}
 
-    def _call_chat(
+    def _ctx_keys(self) -> list[str]:
+        g = self.ctx.get("globals", {})
+        return sorted([str(k) for k in g.keys()])[:24] if isinstance(g, dict) else []
+
+    def _trim(self, value: Any) -> Any:
+        if value is None or isinstance(value, (int, float, bool)):
+            return value
+        if isinstance(value, str):
+            return value[:400]
+        if isinstance(value, dict):
+            out = {}
+            for i, (k, v) in enumerate(value.items()):
+                if i >= 16:
+                    break
+                out[str(k)[:64]] = self._trim(v)
+            return out
+        if isinstance(value, (list, tuple)):
+            return [self._trim(v) for v in list(value)[:16]]
+        return str(value)[:400]
+
+    def _chat(
         self,
         messages: list[dict[str, Any]],
         tools: Optional[list[dict[str, Any]]] = None,
@@ -916,18 +696,18 @@ class RLM(ReasoningLLM):
             create_kwargs["reasoning_effort"] = self.REASONING_EFFORT
 
         try:
-            response = self.client.chat.completions.create(**create_kwargs)
+            resp = self.client.chat.completions.create(**create_kwargs)
         except openai.BadRequestError as exc:
             raise RuntimeError(f"OpenAI request failed in RLM agent: {exc}") from exc
 
-        self.capture_reasoning_from_response(response)
-        usage = getattr(response, "usage", None)
+        self.capture_reasoning_from_response(resp)
+        usage = getattr(resp, "usage", None)
         total_tokens = int(getattr(usage, "total_tokens", 0)) if usage else 0
-        content = response.choices[0].message.content or ""
+        content = resp.choices[0].message.content or ""
         self.track_tokens(total_tokens, content)
-        return response.choices[0].message.model_dump(exclude_none=True)
+        return resp.choices[0].message.model_dump(exclude_none=True)
 
-    def _json_object(self, raw: Any) -> dict[str, Any]:
+    def _json_obj(self, raw: Any) -> dict[str, Any]:
         if isinstance(raw, dict):
             return raw
         if not isinstance(raw, str) or not raw.strip():
@@ -940,17 +720,14 @@ class RLM(ReasoningLLM):
 
     def _safe_int(self, value: Any, default: int, lo: int, hi: int) -> int:
         try:
-            num = int(value)
+            n = int(value)
         except (TypeError, ValueError):
-            num = default
-        return max(lo, min(hi, num))
+            n = default
+        return max(lo, min(hi, n))
 
     def _safe_float(self, value: Any, default: float) -> float:
         try:
-            num = float(value)
+            n = float(value)
         except (TypeError, ValueError):
-            num = default
-        return max(0.0, min(1.0, num))
-
-    def _subproblem_step_budget(self, depth: int) -> int:
-        return max(1, self.RLM_MAX_SUB_STEPS - max(0, depth - 1))
+            n = default
+        return max(0.0, min(1.0, n))
